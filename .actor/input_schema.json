@@ -34,7 +34,7 @@
       "title": "Job age filter",
       "type": "integer",
       "description": "Filter jobs by age: select the maximum age of jobs to include.",
-      "editor": "select",
+      "editor": "number",
       "enum": [1, 7, 30],
       "enumTitles": ["Within 24 hours", "Within 7 days", "Within 30 days"]
     },
