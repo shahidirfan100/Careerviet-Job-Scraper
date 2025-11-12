@@ -2,7 +2,7 @@
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
-import { createHeaderGenerator } from 'header-generator';
+import { HeaderGenerator } from 'header-generator';
 
 // Single-entrypoint main
 await Actor.init();
@@ -52,7 +52,7 @@ async function main() {
         const proxyConf = proxyConfiguration ? await Actor.createProxyConfiguration({ ...proxyConfiguration }) : undefined;
 
         // Header generator for stealth - configured for Careerviet.vn
-        const headerGenerator = createHeaderGenerator({
+        const headerGenerator = new HeaderGenerator({
             browsers: [
                 { name: 'chrome', minVersion: 140, maxVersion: 142 },
                 { name: 'firefox', minVersion: 120 },
