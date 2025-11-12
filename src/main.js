@@ -1,22 +1,20 @@
-// Production-ready jobs scraper (Careerviet.vn example) — Node 22 + ESM
-// Works with deps:
+// Production-ready jobs scraper (Careerviet.vn) — Node 22 + ESM
+// Deps (per your package.json):
 //  apify ^3.4.5, crawlee ^3.14.1, cheerio ^1.0.0-rc.12, header-generator ^2.1.27
 
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 
-// --- FIX: Version-safe import for header-generator (v2 exports default)
-//     Avoids: "does not provide an export named 'createHeaderGenerator'"
+// --- Version-safe import for header-generator (v2 default export)
 import * as HG from 'header-generator';
 const HeaderGeneratorClass = HG.HeaderGenerator || HG.default;
 
-// ---- Utility helpers
+// ---- Small helpers
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const toAbs = (href, base) => {
     try { return new URL(href, base).href; } catch { return null; }
 };
-
 const cleanText = (html) => {
     if (!html) return '';
     const $ = cheerioLoad(html);
@@ -24,7 +22,7 @@ const cleanText = (html) => {
     return $.root().text().replace(/\s+/g, ' ').trim();
 };
 
-// ---- Configure a realistic header generator (desktop mix, EN + VI)
+// ---- Header generator (desktop EN + VI)
 const headerGenerator = new HeaderGeneratorClass({
     browsers: [
         { name: 'chrome', minVersion: 118 },
@@ -40,45 +38,56 @@ await Actor.init();
 
 try {
     const input = (await Actor.getInput()) || {};
+
+    // --- Accept multiple aliases for "how many jobs"
+    const resultsWantedAliases = [
+        input.results_wanted,
+        input.jobs,
+        input.max_items,
+        input.maxItems,
+        input.maxResults,
+        input.limit,
+    ].map((v) => (v == null ? undefined : +v));
+    const firstNumber = resultsWantedAliases.find((v) => Number.isFinite(v));
+    const RESULTS_WANTED = firstNumber ? Math.max(1, firstNumber) : 10; // default 10 to match your schema intent
+
     const {
-        // search params
         keyword = '',
         location = '',
-        max_age_days, // optional: 1 | 7 | 30
+        max_age_days, // optional
 
-        // crawling controls
-        results_wanted: RESULTS_WANTED_RAW = 100,
         max_pages: MAX_PAGES_RAW = 20,
         collectDetails = true,
         dedupe = true,
         maxConcurrency = 5,
 
-        // entry URLs
         startUrl,
         startUrls,
         url,
 
-        // proxy config passed through input (Apify proxy recommended)
         proxyConfiguration,
     } = input;
 
-    const RESULTS_WANTED = Number.isFinite(+RESULTS_WANTED_RAW) ? Math.max(1, +RESULTS_WANTED_RAW) : 100;
     const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 20;
 
-    // ---- Build default listing URL for careerviet.vn if none provided
+    // Build default listing URL if none provided (keeps VN path for backwards-compat)
     const buildStartUrl = (kw, loc) => {
+        // Prefer the English all-jobs page if no filters given
+        const englishAll = 'https://careerviet.vn/jobs/all-jobs-en.html';
+        if (!kw && !loc) return englishAll;
+
+        // Otherwise fall back to the VN filterable listing
         const base = 'https://careerviet.vn/vi/tim-viec-lam/tat-ca-viec-lam';
         const params = new URLSearchParams();
         if (kw) params.set('keyword', kw);
         if (loc) params.set('location', loc);
         if (max_age_days) {
-            // Map days to site's UI when available
             const ageMap = { 1: '24h', 7: '7d', 30: '30d' };
             const v = ageMap[max_age_days];
             if (v) params.set('posted', v);
         }
         const qs = params.toString();
-        return qs ? `${base}?${qs}` : base;
+        return qs ? `${base}?${qs}` : englishAll;
     };
 
     const initial = [];
@@ -126,36 +135,70 @@ try {
         return null;
     }
 
+    // --- BROAD matcher: support both EN and VI job detail URLs
+    // Examples:
+    //  https://careerviet.vn/jobs/some-job-title-12345.html
+    //  https://careerviet.vn/vi/tim-viec-lam/some-title.12345.html
+    const JOB_DETAIL_RE = /careerviet\.vn\/(?:jobs\/[^/?#]+-\d+\.html|vi\/tim-viec-lam\/[^/?#]+\.\d+\.html)/i;
+
     function findJobLinks($, base) {
         const links = new Set();
         $('a[href]').each((_, a) => {
-            const href = $(a).attr('href');
+            const href = ($(a).attr('href') || '').trim();
             if (!href) return;
-            // careerviet detail pattern
-            if (/careerviet\.vn\/vi\/tim-viec-lam\/[^\/]+\.?\d*\.html/i.test(href)) {
-                const abs = toAbs(href, base);
-                if (abs && (!dedupe || !seen.has(abs))) {
+            const abs = toAbs(href, base);
+            if (!abs) return;
+            if (JOB_DETAIL_RE.test(abs)) {
+                if (!dedupe || !seen.has(abs)) {
                     links.add(abs);
                     if (dedupe) seen.add(abs);
                 }
             }
         });
+
+        // Fallback: many sites keep job links inside card blocks; try obvious selectors
+        if (links.size === 0) {
+            $('.job, .job-card, .job-item, [data-job-id]').find('a[href]').each((_, a) => {
+                const href = ($(a).attr('href') || '').trim();
+                const abs = toAbs(href, base);
+                if (abs && JOB_DETAIL_RE.test(abs) && (!dedupe || !seen.has(abs))) {
+                    links.add(abs);
+                    if (dedupe) seen.add(abs);
+                }
+            });
+        }
         return [...links];
     }
 
     function findNextPage($, base, currentPage) {
-        // Try numbered pagination
-        const nextPage = currentPage + 1;
-        let href =
-            $(`a[href*="page=${nextPage}"], a[href*="trang-${nextPage}-vi.html"], a:contains("${nextPage}")`)
+        // 1) Look for explicit rel=next
+        let href = $('a[rel="next"]').attr('href') || null;
+
+        // 2) Common "Next" labels (EN and VI)
+        if (!href) {
+            href = $('a:contains("Next"), a:contains("Tiếp"), a[aria-label*="Next"]')
+                .filter((_, el) => $(el).text().trim().toLowerCase().includes('next') ||
+                                   $(el).text().trim().toLowerCase().includes('tiếp'))
                 .first()
                 .attr('href') || null;
-
-        if (!href) {
-            // Fallback: next/tiếp
-            href = $('a[rel="next"], a:contains("Next"), a:contains("Tiếp")').first().attr('href') || null;
         }
-        return href ? toAbs(href, base) : null;
+
+        // 3) Query param page=2 style (English listing)
+        if (!href) {
+            const nextNum = currentPage + 1;
+            href = $(`a[href*="page=${nextNum}"]`).first().attr('href') || null;
+        }
+
+        // 4) VN style "trang-2-vi.html"
+        if (!href) {
+            const nextNum = currentPage + 1;
+            href = $(`a[href*="trang-${nextNum}-vi.html"]`).first().attr('href') || null;
+        }
+
+        if (!href) return null;
+        const abs = toAbs(href, base);
+        if (abs) log.debug(`Pagination: next page resolved -> ${abs}`);
+        return abs;
     }
 
     const crawler = new CheerioCrawler({
@@ -166,18 +209,15 @@ try {
         maxConcurrency,
         proxyConfiguration: proxyConf,
 
-        // Stealth headers + cadence jitter
         preNavigationHooks: [
             async (ctx) => {
                 const headers = headerGenerator.getHeaders();
                 ctx.request.headers = { ...ctx.request.headers, ...headers };
-                if (ctx.request.userData?.label === 'LIST') {
-                    ctx.request.headers.referer = 'https://careerviet.vn/vi/';
-                } else if (ctx.request.userData?.label === 'DETAIL') {
-                    ctx.request.headers.referer = 'https://careerviet.vn/vi/tim-viec-lam/tat-ca-viec-lam';
-                }
-                // small random delay before nav
-                await sleep(800 + Math.floor(Math.random() * 1700));
+                ctx.request.headers.referer =
+                    ctx.request.userData?.label === 'DETAIL'
+                        ? 'https://careerviet.vn/jobs/all-jobs-en.html'
+                        : 'https://careerviet.vn/';
+                await sleep(700 + Math.floor(Math.random() * 1600));
             },
         ],
 
@@ -185,18 +225,19 @@ try {
             const label = request.userData?.label || 'LIST';
             const pageNo = request.userData?.pageNo || 1;
 
-            // vary cadence a bit per request
-            await sleep(600 + Math.floor(Math.random() * 1500));
+            await sleep(500 + Math.floor(Math.random() * 1200));
 
             if (label === 'LIST') {
                 const links = findJobLinks($, request.url);
-                clog.info(`LIST p${pageNo}: found ${links.length} jobs`);
+                clog.info(`LIST p${pageNo}: found ${links.length} candidate job links`);
 
                 if (collectDetails) {
                     const remaining = RESULTS_WANTED - saved;
                     if (remaining > 0) {
+                        const slice = links.slice(0, remaining);
+                        clog.debug(`Enqueueing ${slice.length} detail URLs (remaining target: ${remaining})`);
                         await enqueueLinks({
-                            urls: links.slice(0, remaining),
+                            urls: slice,
                             userData: { label: 'DETAIL' },
                             forefront: false,
                         });
@@ -224,6 +265,8 @@ try {
                             userData: { label: 'LIST', pageNo: pageNo + 1 },
                             forefront: false,
                         });
+                    } else {
+                        clog.info(`No next page link detected on p${pageNo}.`);
                     }
                 }
                 return;
@@ -236,38 +279,31 @@ try {
                     const json = extractFromJsonLd($) || {};
                     const data = { ...json };
 
-                    // Fallback selectors for core fields
                     if (!data.title) {
                         data.title =
                             $('h1.job-title, .job-title h1, .title h1, h1').first().text().trim() ||
-                            $('[class*="job-title"]').first().text().trim() ||
-                            null;
+                            $('[class*="job-title"]').first().text().trim() || null;
                     }
                     if (!data.company) {
                         data.company =
-                            $('.company-name, .employer-name, [class*="company"], a[href*="nha-tuyen-dung"]')
-                                .first()
-                                .text()
-                                .trim() || null;
+                            $('.company-name, .employer-name, [class*="company"], a[href*="nha-tuyen-dung"], a[href*="/employer/"]')
+                                .first().text().trim() || null;
                     }
                     if (!data.location) {
                         data.location =
-                            $('[class*="location"], [class*="address"], .location span').first().text().trim() ||
-                            null;
+                            $('[class*="location"], [class*="address"], .location span').first().text().trim() || null;
                     }
                     if (!data.salary) {
                         data.salary =
-                            $('[class*="salary"], .salary, [class*="luong"]').first().text().trim() ||
-                            null;
+                            $('[class*="salary"], .salary, [class*="luong"]').first().text().trim() || null;
                     }
                     if (!data.job_type) {
                         data.job_type =
-                            $('[class*="job-type"], [class*="employment"]').first().text().trim() ||
-                            null;
+                            $('[class*="job-type"], [class*="employment"]').first().text().trim() || null;
                     }
                     if (!data.date_posted) {
                         const dt =
-                            $('[class*="date"], [class*="posted"], time').first().attr('datetime') ||
+                            $('time[datetime]').first().attr('datetime') ||
                             $('[class*="date"], [class*="posted"], time').first().text().trim() ||
                             null;
                         data.date_posted = dt || null;
@@ -291,7 +327,6 @@ try {
                     }
                     data.description_text = data.description_html ? cleanText(data.description_html) : null;
 
-                    // Optional: discard too-old jobs by days
                     if (max_age_days && data.date_posted) {
                         const posted = new Date(data.date_posted);
                         if (!Number.isNaN(+posted)) {
@@ -321,7 +356,6 @@ try {
                     clog.info(`Saved ${saved}/${RESULTS_WANTED}: ${item.title || request.url}`);
                 } catch (err) {
                     clog.error(`DETAIL error ${request.url}: ${err?.message || err}`);
-                    // retire session on typical block clues
                     if (/403|429|forbidden|blocked/i.test(String(err?.message || ''))) {
                         session?.retire();
                     }
@@ -335,13 +369,15 @@ try {
         },
     });
 
-    log.info(`Starting with ${initial.length} start URL(s). Target: ${RESULTS_WANTED} results, max pages ${MAX_PAGES}.`);
+    log.info(
+        `Start: ${initial.length} start URL(s). Target: ${RESULTS_WANTED} jobs. Max pages: ${MAX_PAGES}. Concurrency: ${maxConcurrency}.`,
+    );
 
     await crawler.run(
         initial.map((u) => ({ url: u, userData: { label: 'LIST', pageNo: 1 } })),
     );
 
-    log.info(`Finished. Saved ${saved} item(s).`);
+    log.info(`Finished. Saved ${saved} job(s).`);
 } catch (e) {
     log.exception(e, 'Actor failed');
     process.exitCode = 1;
