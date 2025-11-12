@@ -5,11 +5,11 @@ import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
 import { load as cheerioLoad } from 'cheerio';
 
-// Version-safe import (v2 default export)
+// Version-safe import (v2 default export for header-generator)
 import * as HG from 'header-generator';
 const HeaderGeneratorClass = HG.HeaderGenerator || HG.default;
 
-// ---------- Helpers ----------
+// ---------- Small helpers ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const toAbs = (href, base) => { try { return new URL(href, base).href; } catch { return null; } };
 const text = ($el) => ($el?.text?.() || '').replace(/\s+/g, ' ').trim();
@@ -26,53 +26,94 @@ const cleanText = (rawHtml) => {
 const JOB_DETAIL_RE =
   /careerviet\.vn\/(?:(?:en\/search-job\/[^/?#]+\.[A-Za-z0-9]+\.html)|(?:vi\/tim-viec-lam\/[^/?#]+\.\d+\.html)|(?:jobs\/[^/?#]+-\d+\.html))/i;
 
-// ---------- Normalizers to keep data clean ----------
+// ---------- Safe coercers & normalizers ----------
+const toStr = (v) => {
+  if (v == null) return '';
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) return v.filter(Boolean).map((x) => toStr(x)).filter(Boolean).join(' | ');
+  if (typeof v === 'number') return String(v);
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+};
+
+// JSON-LD salary -> compact human string
+function coerceSalary(value) {
+  if (!value) return null;
+  if (typeof value === 'string') return value.trim();
+
+  try {
+    const v = value.value && typeof value.value === 'object' ? value.value : value;
+    const cur = value.currency || v.currency || '';
+    const min = v.minValue ?? v.value ?? v.min ?? null;
+    const max = v.maxValue ?? v.max ?? null;
+    const unit = v.unitText || v.unit || '';
+
+    const moneyFmt = (num) => (num == null ? null : String(num).replace(/\B(?=(\d{3})+(?!\d))/g, ','));
+    const curSym = /vnd|₫/i.test(cur) ? '₫' : (/usd|\$/i.test(cur) ? '$' : (cur || ''));
+
+    if (min != null && max != null) {
+      return `${curSym ? curSym + ' ' : ''}${moneyFmt(min)} - ${curSym ? curSym + ' ' : ''}${moneyFmt(max)}${unit ? ` / ${unit}` : ''}`.trim();
+    }
+    if (min != null) {
+      return `${curSym ? curSym + ' ' : ''}${moneyFmt(min)}${unit ? ` / ${unit}` : ''}`.trim();
+    }
+    return toStr(value);
+  } catch {
+    return toStr(value);
+  }
+}
+
 function normalizeJobType(s) {
-  if (!s) return null;
-  const v = s.toLowerCase();
+  const raw = toStr(s).trim();
+  if (!raw) return null;
+  const v = raw.toLowerCase();
 
   // EN
-  if (/(full[\s-]?time|permanent)/i.test(s)) return 'Full-time';
-  if (/(part[\s-]?time)/i.test(s)) return 'Part-time';
-  if (/(intern|internship)/i.test(s)) return 'Internship';
-  if (/(contract|fixed[-\s]?term)/i.test(s)) return 'Contract';
-  if (/(temporary|temp)/i.test(s)) return 'Temporary';
-  if (/(freelance|self[-\s]?employed)/i.test(s)) return 'Freelance';
-  if (/(remote)/i.test(s)) return 'Remote';
-  if (/(hybrid)/i.test(s)) return 'Hybrid';
+  if (/full[\s-]?time|permanent/.test(v)) return 'Full-time';
+  if (/part[\s-]?time/.test(v)) return 'Part-time';
+  if (/intern|internship/.test(v)) return 'Internship';
+  if (/contract|fixed[-\s]?term/.test(v)) return 'Contract';
+  if (/temporary|temp/.test(v)) return 'Temporary';
+  if (/freelance|self[-\s]?employed/.test(v)) return 'Freelance';
+  if (/\bremote\b/.test(v)) return 'Remote';
+  if (/\bhybrid\b/.test(v)) return 'Hybrid';
 
   // VI
-  if (/(toàn\s*thời\s*gian)/i.test(s)) return 'Full-time';
-  if (/(bán\s*thời\s*gian)/i.test(s)) return 'Part-time';
-  if (/(thực\s*tập)/i.test(s)) return 'Internship';
-  if (/(hợp\s*đồng)/i.test(s)) return 'Contract';
-  if (/(tạm\s*thời)/i.test(s)) return 'Temporary';
-  if (/(tự\s*do)/i.test(s)) return 'Freelance';
-  if (/(từ\s*xa)/i.test(s)) return 'Remote';
-  if (/(lai)/i.test(v)) return 'Hybrid';
+  if (/toàn\s*thời\s*gian/.test(v)) return 'Full-time';
+  if (/bán\s*thời\s*gian/.test(v)) return 'Part-time';
+  if (/thực\s*tập/.test(v)) return 'Internship';
+  if (/hợp\s*đồng/.test(v)) return 'Contract';
+  if (/tạm\s*thời/.test(v)) return 'Temporary';
+  if (/tự\s*do/.test(v)) return 'Freelance';
+  if (/từ\s*xa/.test(v)) return 'Remote';
+  if (/lai/.test(v)) return 'Hybrid';
 
   // Avoid category dumps
-  if (s.length > 120 || /jobs?/i.test(s)) return null;
-  return s.trim();
+  if (raw.length > 120 || /jobs?\b/i.test(raw)) return null;
+  return raw;
 }
 
 function normalizeLocation(s) {
-  if (!s) return null;
-  if (s.length > 120 || /jobs?/i.test(s)) return null;
+  const raw = toStr(s).trim();
+  if (!raw) return null;
+  if (raw.length > 120 || /jobs?\b/i.test(raw)) return null;
 
-  s = s.replace(/(View map|Bản đồ)/i, '').replace(/\s{2,}/g, ' ').trim();
-  const parts = s.split(/[|,•/]+/).map((p) => p.trim()).filter(Boolean);
-  if (parts.length) return parts[0];
-  return s || null;
+  const cleaned = raw.replace(/(View map|Bản đồ)/i, '').replace(/\s{2,}/g, ' ').trim();
+  const parts = cleaned.split(/[|,•/]+/).map((p) => p.trim()).filter(Boolean);
+  return parts[0] || cleaned || null;
 }
 
 function normalizeSalary(s) {
-  if (!s) return null;
-  const raw = s.replace(/\s+/g, ' ').trim();
+  // Try JSON-LD object formatting first
+  const asStr = coerceSalary(s);
+  if (!asStr) return null;
+
+  const raw = toStr(asStr).replace(/\s+/g, ' ').trim();
+  if (!raw) return null;
 
   if (/negotiable|thoả thuận|thỏa thuận/i.test(raw)) return 'Negotiable';
 
-  const money = raw.match(/(\$|USD|₫|VND)\s?[\d.,]+(?:\s*-\s*(\$|USD|₫|VND)?\s?[\d.,]+)?/i);
+  const money = raw.match(/(\$|USD|₫|VND)\s?[\d.,]+(?:\s*[-–]\s*(\$|USD|₫|VND)?\s?[\d.,]+)?/i);
   if (money) {
     const period = raw.match(/per\s+(hour|month|year)|\/\s*(hour|month|year)|\/\s*(giờ|tháng|năm)/i);
     return money[0] + (period ? ` / ${period[1] || period[2] || period[3]}` : '');
@@ -84,11 +125,11 @@ function normalizeSalary(s) {
   const singleMoney = raw.match(/(\$|USD|₫|VND)\s?[\d.,]+/i);
   if (singleMoney) return singleMoney[0];
 
-  if (raw.length > 120 || /jobs?/i.test(raw)) return null;
+  if (raw.length > 120 || /jobs?\b/i.test(raw)) return null;
   return raw;
 }
 
-// Label-based extractor: finds label text, returns sibling/next cell text within allowed roots.
+// ---------- Label-based meta extractor (scoped to meta blocks) ----------
 function getMetaByLabel($, labelPatterns, roots) {
   delete getMetaByLabel._found;
 
@@ -145,6 +186,7 @@ function getMetaByLabel($, labelPatterns, roots) {
   return null;
 }
 
+// ---------- JSON-LD extraction ----------
 function extractFromJsonLd($) {
   const scripts = $('script[type="application/ld+json"]');
   for (let i = 0; i < scripts.length; i++) {
@@ -162,7 +204,7 @@ function extractFromJsonLd($) {
             date_posted: node.datePosted || null,
             description_html: node.description || null,
             location: node.jobLocation?.address?.addressLocality || node.jobLocation?.address?.addressRegion || null,
-            salary: node.baseSalary?.value || null,
+            salary: node.baseSalary ? coerceSalary(node.baseSalary) : null, // <- salary object friendly
             job_type: node.employmentType || null,
           };
         }
@@ -172,6 +214,7 @@ function extractFromJsonLd($) {
   return null;
 }
 
+// ---------- Link discovery & pagination ----------
 function findJobLinks($, base, dedupeSet) {
   const out = new Set();
   $('a[href]').each((_, a) => {
@@ -276,7 +319,7 @@ try {
     return qs ? `${base}?${qs}` : englishAll;
   }
 
-  // -------- Single declaration of `initial` (fixes "Cannot redeclare" error) --------
+  // Single declaration of `initial`
   const initial = [];
   if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls);
   if (startUrl) initial.push(startUrl);
@@ -356,10 +399,11 @@ try {
         if (saved >= RESULTS_WANTED) return;
 
         try {
-          // ----------- CORE EXTRACTION -----------
+          // 1) JSON-LD first
           const json = extractFromJsonLd($) || {};
           const data = { ...json };
 
+          // 2) Title/company fallbacks
           if (!data.title) {
             data.title =
               text($('h1.job-title, .job-title h1, .title h1, h1').first()) ||
@@ -371,21 +415,24 @@ try {
               null;
           }
 
-          // Main meta blocks (avoid sidebars)
+          // 3) Meta roots (avoid sidebars)
           const META_ROOTS = [
             '.job-summary', '.job-info', '.job-meta', '.job-details', '.box-info', '.box-summary',
             '.job-header', '.job-main', '.job-overview', '.job-brief', '.job-information',
             'article .summary', 'article .meta', '.content .meta',
           ].map((s) => `${s}:not(.sidebar):not(.aside)`);
 
+          // Label regexes (EN + VI)
           const reLocation = [/^(location|work\s*location|địa\s*điểm|nơi\s*làm\s*việc|khu\s*vực)$/i];
           const reSalary   = [/^(salary|mức\s*lương|thu\s*nhập)$/i];
           const reType     = [/^(job\s*type|employment|loại\s*công\s*việc|hình\s*thức\s*làm\s*việc)$/i];
 
+          // 4) Label-based extraction (tables, lists, dl)
           let metaLocation = getMetaByLabel($, reLocation, META_ROOTS);
           let metaSalary   = getMetaByLabel($, reSalary, META_ROOTS);
           let metaType     = getMetaByLabel($, reType, META_ROOTS);
 
+          // 5) Tight CSS fallbacks scoped to meta blocks
           const scopedFind = (selectors) => {
             for (const rootSel of META_ROOTS) {
               const root = $(rootSel).first();
@@ -420,17 +467,24 @@ try {
             ]);
           }
 
-          data.location = normalizeLocation(metaLocation || data.location || null);
-          data.salary   = normalizeSalary(metaSalary || data.salary || null);
-          data.job_type = normalizeJobType(metaType || data.job_type || null);
+          // 6) Coerce then normalize (handles arrays/objects safely)
+          const rawLocation = metaLocation || data.location || null;
+          const rawSalary   = metaSalary   || data.salary   || null;
+          const rawType     = metaType     || data.job_type || null;
 
+          data.location = normalizeLocation(rawLocation);
+          data.salary   = normalizeSalary(rawSalary);
+          data.job_type = normalizeJobType(rawType);
+
+          // 7) Date posted fallback
           if (!data.date_posted) {
             const dt =
               $('time[datetime]').first().attr('datetime') ||
               text($('[class*="date"], [class*="posted"], time').first());
-            data.date_posted = (dt || null);
+            data.date_posted = dt || null;
           }
 
+          // 8) Description fallback
           if (!data.description_html) {
             const descSel = [
               '.job-description', '.description', '[class*="description"]',
@@ -444,6 +498,7 @@ try {
           }
           data.description_text = data.description_html ? cleanText(data.description_html) : null;
 
+          // 9) Optional age filter
           if (max_age_days && data.date_posted) {
             const posted = new Date(data.date_posted);
             if (!Number.isNaN(+posted)) {
@@ -484,7 +539,7 @@ try {
     },
   });
 
-  // ---------- Boot (single `initial`) ----------
+  // ---------- Boot ----------
   log.info(`Start: ${initial[0]} | target=${RESULTS_WANTED} | maxPages=${MAX_PAGES} | concurrency=${maxConcurrency}`);
   await crawler.run(initial.map((u) => ({ url: u, userData: { label: 'LIST', pageNo: 1 } })));
   log.info(`Finished. Saved ${saved} job(s).`);
