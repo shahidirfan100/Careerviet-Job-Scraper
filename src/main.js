@@ -252,7 +252,7 @@ async function main() {
                             const postedDate = new Date(data.date_posted);
                             const now = new Date();
                             const diffDays = (now - postedDate) / (1000 * 60 * 60 * 24);
-                            if (diffDays > max_age_days) {
+                            if (diffDays > +max_age_days) {
                                 crawlerLog.info(`Skipping old job: ${data.title} (${diffDays.toFixed(1)} days old)`);
                                 return;
                             }
