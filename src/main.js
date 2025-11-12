@@ -1,5 +1,5 @@
-// CareerViet jobs scraper — fast & stealthy — EN + VI
-// Works with deps you listed: apify ^3.4.5, crawlee ^3.14.1, cheerio ^1.0.0-rc.12, header-generator ^2.1.27
+// CareerViet jobs scraper — fast, stealthy, and CLEAN meta fields (EN + VI)
+// Works with: apify ^3.4.5, crawlee ^3.14.1, cheerio ^1.0.0-rc.12, header-generator ^2.1.27
 
 import { Actor, log } from 'apify';
 import { CheerioCrawler, Dataset } from 'crawlee';
@@ -12,20 +12,138 @@ const HeaderGeneratorClass = HG.HeaderGenerator || HG.default;
 // ---------- Helpers ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const toAbs = (href, base) => { try { return new URL(href, base).href; } catch { return null; } };
+const text = ($el) => ($el?.text?.() || '').replace(/\s+/g, ' ').trim();
+const html = ($el) => ($el?.html?.() || '').trim() || '';
 
-const cleanText = (html) => {
-  if (!html) return '';
-  const $ = cheerioLoad(html);
-  $('script, style, noscript, iframe, .hidden, [style*="display:none"]').remove();
+const cleanText = (rawHtml) => {
+  if (!rawHtml) return '';
+  const $ = cheerioLoad(rawHtml);
+  $('script, style, noscript, iframe').remove();
   return $.root().text().replace(/\s+/g, ' ').trim();
 };
 
-// A single, very permissive matcher for EN + VI + legacy detail pages.
-//  EN current: /en/search-job/<slug>.<A-Za-z0-9>.html
-//  VI:         /vi/tim-viec-lam/<slug>.<digits>.html
-//  Legacy EN:  /jobs/<slug>-<digits>.html
+// EN + VI + legacy job detail URL patterns
 const JOB_DETAIL_RE =
   /careerviet\.vn\/(?:(?:en\/search-job\/[^/?#]+\.[A-Za-z0-9]+\.html)|(?:vi\/tim-viec-lam\/[^/?#]+\.\d+\.html)|(?:jobs\/[^/?#]+-\d+\.html))/i;
+
+// ---------- Normalizers to keep data clean ----------
+function normalizeJobType(s) {
+  if (!s) return null;
+  const v = s.toLowerCase();
+
+  // EN
+  if (/(full[\s-]?time|permanent)/i.test(s)) return 'Full-time';
+  if (/(part[\s-]?time)/i.test(s)) return 'Part-time';
+  if (/(intern|internship)/i.test(s)) return 'Internship';
+  if (/(contract|fixed[-\s]?term)/i.test(s)) return 'Contract';
+  if (/(temporary|temp)/i.test(s)) return 'Temporary';
+  if (/(freelance|self[-\s]?employed)/i.test(s)) return 'Freelance';
+  if (/(remote)/i.test(s)) return 'Remote';
+  if (/(hybrid)/i.test(s)) return 'Hybrid';
+
+  // VI
+  if (/(toàn\s*thời\s*gian)/i.test(s)) return 'Full-time';
+  if (/(bán\s*thời\s*gian)/i.test(s)) return 'Part-time';
+  if (/(thực\s*tập)/i.test(s)) return 'Internship';
+  if (/(hợp\s*đồng)/i.test(s)) return 'Contract';
+  if (/(tạm\s*thời)/i.test(s)) return 'Temporary';
+  if (/(tự\s*do)/i.test(s)) return 'Freelance';
+  if (/(từ\s*xa)/i.test(s)) return 'Remote';
+  if (/(lai)/i.test(v)) return 'Hybrid';
+
+  // Avoid category dumps
+  if (s.length > 120 || /jobs?/i.test(s)) return null;
+  return s.trim();
+}
+
+function normalizeLocation(s) {
+  if (!s) return null;
+  if (s.length > 120 || /jobs?/i.test(s)) return null;
+
+  s = s.replace(/(View map|Bản đồ)/i, '').replace(/\s{2,}/g, ' ').trim();
+  const parts = s.split(/[|,•/]+/).map((p) => p.trim()).filter(Boolean);
+  if (parts.length) return parts[0];
+  return s || null;
+}
+
+function normalizeSalary(s) {
+  if (!s) return null;
+  const raw = s.replace(/\s+/g, ' ').trim();
+
+  if (/negotiable|thoả thuận|thỏa thuận/i.test(raw)) return 'Negotiable';
+
+  const money = raw.match(/(\$|USD|₫|VND)\s?[\d.,]+(?:\s*-\s*(\$|USD|₫|VND)?\s?[\d.,]+)?/i);
+  if (money) {
+    const period = raw.match(/per\s+(hour|month|year)|\/\s*(hour|month|year)|\/\s*(giờ|tháng|năm)/i);
+    return money[0] + (period ? ` / ${period[1] || period[2] || period[3]}` : '');
+  }
+
+  const rangeNums = raw.match(/[\d.,]+\s*[-–]\s*[\d.,]+/);
+  if (rangeNums) return rangeNums[0];
+
+  const singleMoney = raw.match(/(\$|USD|₫|VND)\s?[\d.,]+/i);
+  if (singleMoney) return singleMoney[0];
+
+  if (raw.length > 120 || /jobs?/i.test(raw)) return null;
+  return raw;
+}
+
+// Label-based extractor: finds label text, returns sibling/next cell text within allowed roots.
+function getMetaByLabel($, labelPatterns, roots) {
+  delete getMetaByLabel._found;
+
+  for (const rootSel of roots) {
+    const root = $(rootSel).first();
+    if (!root.length) continue;
+
+    // 1) Definition lists
+    root.find('dt, .dt, .label, .name').each((_, el) => {
+      const t = text($(el));
+      if (!t) return;
+      for (const re of labelPatterns) {
+        if (re.test(t)) {
+          const val = text($(el).next('dd, .dd, .value'));
+          if (val) return (getMetaByLabel._found = val);
+        }
+      }
+    });
+    if (getMetaByLabel._found) return getMetaByLabel._found;
+
+    // 2) Tables
+    root.find('tr').each((_, tr) => {
+      const $tr = $(tr);
+      const key = text($tr.find('th, td').first());
+      const val = text($tr.find('td').eq(1));
+      if (!key || !val) return;
+      for (const re of labelPatterns) if (re.test(key)) return (getMetaByLabel._found = val);
+    });
+    if (getMetaByLabel._found) return getMetaByLabel._found;
+
+    // 3) Key:Value in lists/blocks
+    root.find('li, .row, .item, .field').each((_, li) => {
+      const $li = $(li);
+      const key = text($li.find('strong, b, .label, .name, .title').first()) || text($li.children().first());
+      const val = text($li.find('.value, .content, span, div').not('.label,.name,.title').last());
+      if (!key || !val) return;
+      for (const re of labelPatterns) if (re.test(key)) return (getMetaByLabel._found = val);
+    });
+    if (getMetaByLabel._found) return getMetaByLabel._found;
+
+    // 4) Inline "Label: Value"
+    root.find('*').each((_, el) => {
+      const t = text($(el));
+      if (!t) return;
+      const m = t.match(/^([^:：]+)\s*[:：]\s*(.+)$/);
+      if (m) {
+        const key = m[1].trim();
+        const val = m[2].trim();
+        for (const re of labelPatterns) if (re.test(key)) return (getMetaByLabel._found = val);
+      }
+    });
+    if (getMetaByLabel._found) return getMetaByLabel._found;
+  }
+  return null;
+}
 
 function extractFromJsonLd($) {
   const scripts = $('script[type="application/ld+json"]');
@@ -56,16 +174,12 @@ function extractFromJsonLd($) {
 
 function findJobLinks($, base, dedupeSet) {
   const out = new Set();
-
-  // 1) Broad scan across all anchors
   $('a[href]').each((_, a) => {
     const href = ($(a).attr('href') || '').trim();
     if (!href) return;
     const abs = toAbs(href, base);
     if (abs && JOB_DETAIL_RE.test(abs)) out.add(abs);
   });
-
-  // 2) Fallback: scan common “card/title” blocks if 0 found
   if (out.size === 0) {
     $('h2 a[href], .job, .job-card, .job-item, [data-job-id]').find('a[href]').each((_, a) => {
       const href = ($(a).attr('href') || '').trim();
@@ -73,51 +187,38 @@ function findJobLinks($, base, dedupeSet) {
       if (abs && JOB_DETAIL_RE.test(abs)) out.add(abs);
     });
   }
-
   const links = [...out];
   const deduped = links.filter((u) => !dedupeSet.has(u));
   for (const u of deduped) dedupeSet.add(u);
   return deduped;
 }
 
-// English pagination uses file pattern ...-page-N-en.html; the pager is also numeric (2, 3, 4...).
 function findNextPage($, base, currentPage) {
-  // 1) rel="next"
   let href = $('a[rel="next"]').attr('href') || null;
-
-  // 2) "Next"/"Tiếp"
   if (!href) {
     href = $('a:contains("Next"), a:contains("Tiếp"), a[aria-label*="Next"]')
-      .filter((_, el) => $(el).text().trim().toLowerCase().includes('next') || $(el).text().trim().toLowerCase().includes('tiếp'))
-      .first().attr('href') || null;
+      .filter((_, el) => /next|tiếp/i.test(text($(el)))).first().attr('href') || null;
   }
-
-  // 3) EN page files: ...-page-(N)-en.html
   if (!href) {
     const nextNum = currentPage + 1;
     href = $(`a[href*="-page-${nextNum}-en.html"]`).first().attr('href') || null;
   }
-
-  // 4) Numeric anchor pointing to another page file
   if (!href) {
     const nextNum = currentPage + 1;
-    const a = $(`a:contains("${nextNum}")`).filter((_, el) => $(el).text().trim() === String(nextNum)).first();
+    const a = $(`a:contains("${nextNum}")`).filter((_, el) => text($(el)) === String(nextNum)).first();
     href = a.attr('href') || null;
   }
-
-  // 5) VN style: trang-N-vi.html
   if (!href) {
     const nextNum = currentPage + 1;
     href = $(`a[href*="trang-${nextNum}-vi.html"]`).first().attr('href') || null;
   }
-
   if (!href) return null;
   const abs = toAbs(href, base);
   if (abs) log.debug(`Pagination -> ${abs}`);
   return abs;
 }
 
-// ---------- Header generator (desktop profiles, EN + VI) ----------
+// ---------- Header generator ----------
 const headerGenerator = new HeaderGeneratorClass({
   browsers: [{ name: 'chrome', minVersion: 120 }, { name: 'firefox', minVersion: 115 }, { name: 'safari', minVersion: 16 }],
   devices: ['desktop'],
@@ -159,10 +260,9 @@ try {
   const MAX_PAGES = Number.isFinite(+MAX_PAGES_RAW) ? Math.max(1, +MAX_PAGES_RAW) : 25;
 
   function buildStartUrl(kw, loc) {
-    const englishAll = 'https://careerviet.vn/jobs/all-jobs-en.html'; // verified list page
+    const englishAll = 'https://careerviet.vn/jobs/all-jobs-en.html';
     if (!kw && !loc) return englishAll;
 
-    // If filters are requested, VN listing provides query params
     const base = 'https://careerviet.vn/vi/tim-viec-lam/tat-ca-viec-lam';
     const params = new URLSearchParams();
     if (kw) params.set('keyword', kw);
@@ -176,6 +276,7 @@ try {
     return qs ? `${base}?${qs}` : englishAll;
   }
 
+  // -------- Single declaration of `initial` (fixes "Cannot redeclare" error) --------
   const initial = [];
   if (Array.isArray(startUrls) && startUrls.length) initial.push(...startUrls);
   if (startUrl) initial.push(startUrl);
@@ -205,7 +306,6 @@ try {
           ctx.request.userData?.label === 'DETAIL'
             ? 'https://careerviet.vn/jobs/all-jobs-en.html'
             : 'https://careerviet.vn/';
-        // Short, randomized cadence — fast but humane
         const jitter = ctx.request.userData?.label === 'DETAIL'
           ? detailDelayMsMin + Math.floor(Math.random() * (detailDelayMsMax - detailDelayMsMin + 1))
           : listDelayMsMin + Math.floor(Math.random() * (listDelayMsMax - listDelayMsMin + 1));
@@ -256,52 +356,94 @@ try {
         if (saved >= RESULTS_WANTED) return;
 
         try {
+          // ----------- CORE EXTRACTION -----------
           const json = extractFromJsonLd($) || {};
           const data = { ...json };
 
-          // Robust fallbacks (EN + VI)
           if (!data.title) {
             data.title =
-              $('h1.job-title, .job-title h1, .title h1, h1').first().text().trim() ||
-              $('[class*="job-title"]').first().text().trim() || null;
+              text($('h1.job-title, .job-title h1, .title h1, h1').first()) ||
+              text($('[class*="job-title"]').first()) || null;
           }
           if (!data.company) {
             data.company =
-              $('.company-name, .employer-name, [class*="company"], a[href*="/company/"], a[href*="nha-tuyen-dung"]')
-                .first().text().trim() || null;
+              text($('.company-name, .employer-name, [class*="company"], a[href*="/company/"], a[href*="nha-tuyen-dung"]').first()) ||
+              null;
           }
-          if (!data.location) {
-            data.location =
-              $('[class*="location"], [class*="address"], .location span').first().text().trim() ||
-              $('li:contains("Location")').next().text().trim() || null;
+
+          // Main meta blocks (avoid sidebars)
+          const META_ROOTS = [
+            '.job-summary', '.job-info', '.job-meta', '.job-details', '.box-info', '.box-summary',
+            '.job-header', '.job-main', '.job-overview', '.job-brief', '.job-information',
+            'article .summary', 'article .meta', '.content .meta',
+          ].map((s) => `${s}:not(.sidebar):not(.aside)`);
+
+          const reLocation = [/^(location|work\s*location|địa\s*điểm|nơi\s*làm\s*việc|khu\s*vực)$/i];
+          const reSalary   = [/^(salary|mức\s*lương|thu\s*nhập)$/i];
+          const reType     = [/^(job\s*type|employment|loại\s*công\s*việc|hình\s*thức\s*làm\s*việc)$/i];
+
+          let metaLocation = getMetaByLabel($, reLocation, META_ROOTS);
+          let metaSalary   = getMetaByLabel($, reSalary, META_ROOTS);
+          let metaType     = getMetaByLabel($, reType, META_ROOTS);
+
+          const scopedFind = (selectors) => {
+            for (const rootSel of META_ROOTS) {
+              const root = $(rootSel).first();
+              if (!root.length) continue;
+              for (const sel of selectors) {
+                const v = text(root.find(sel).first());
+                if (v) return v;
+              }
+            }
+            return null;
+          };
+
+          if (!metaLocation) {
+            metaLocation = scopedFind([
+              '.location, [class*="location"] span, li.location span',
+              'li:contains("Location") span, li:contains("Địa điểm") span',
+              'td:contains("Location") + td, td:contains("Địa điểm") + td',
+            ]);
           }
-          if (!data.salary) {
-            data.salary =
-              $('[class*="salary"], .salary, [class*="luong"]').first().text().trim() ||
-              $('li:contains("Salary")').next().text().trim() || null;
+          if (!metaSalary) {
+            metaSalary = scopedFind([
+              '.salary, [class*="salary"] span, li.salary span',
+              'li:contains("Salary") span, li:contains("Mức lương") span, li:contains("Thu nhập") span',
+              'td:contains("Salary") + td, td:contains("Mức lương") + td, td:contains("Thu nhập") + td',
+            ]);
           }
-          if (!data.job_type) {
-            data.job_type =
-              $('[class*="job-type"], [class*="employment"]').first().text().trim() ||
-              $('li:contains("Job type")').next().text().trim() || null;
+          if (!metaType) {
+            metaType = scopedFind([
+              '.employment, .job-type, [class*="employment"] span, [class*="job-type"] span',
+              'li:contains("Job type") span, li:contains("Employment") span, li:contains("Hình thức") span, li:contains("Loại công việc") span',
+              'td:contains("Job type") + td, td:contains("Employment") + td, td:contains("Hình thức") + td, td:contains("Loại công việc") + td',
+            ]);
           }
+
+          data.location = normalizeLocation(metaLocation || data.location || null);
+          data.salary   = normalizeSalary(metaSalary || data.salary || null);
+          data.job_type = normalizeJobType(metaType || data.job_type || null);
+
           if (!data.date_posted) {
             const dt =
               $('time[datetime]').first().attr('datetime') ||
-              $('[class*="date"], [class*="posted"], time').first().text().trim() ||
-              $('li:contains("Updated")').next().text().trim() || null;
-            data.date_posted = dt || null;
+              text($('[class*="date"], [class*="posted"], time').first());
+            data.date_posted = (dt || null);
           }
+
           if (!data.description_html) {
-            const descSel = ['.job-description', '.description', '[class*="description"]', '.content', '[class*="content"]', '.entry-content'];
+            const descSel = [
+              '.job-description', '.description', '[class*="description"]',
+              '.content', '[class*="content"]', '.entry-content', 'article .content',
+            ];
             for (const s of descSel) {
               const el = $(s).first();
-              if (el.length && (el.html() || '').trim()) { data.description_html = el.html().trim(); break; }
+              const h = html(el);
+              if (h) { data.description_html = h; break; }
             }
           }
           data.description_text = data.description_html ? cleanText(data.description_html) : null;
 
-          // Optional age filter
           if (max_age_days && data.date_posted) {
             const posted = new Date(data.date_posted);
             if (!Number.isNaN(+posted)) {
@@ -342,6 +484,7 @@ try {
     },
   });
 
+  // ---------- Boot (single `initial`) ----------
   log.info(`Start: ${initial[0]} | target=${RESULTS_WANTED} | maxPages=${MAX_PAGES} | concurrency=${maxConcurrency}`);
   await crawler.run(initial.map((u) => ({ url: u, userData: { label: 'LIST', pageNo: 1 } })));
   log.info(`Finished. Saved ${saved} job(s).`);
